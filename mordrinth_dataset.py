@@ -248,7 +248,7 @@ def main():
     os.makedirs("./datasets", exist_ok=True)
     df = pd.DataFrame(records)
     df = df.drop_duplicates(subset=["slug"])
-    out = "./datasets/mordrinth_dataset.csv"
+    out = "./datasets/modrinth_dataset.csv"
     df.to_csv(out, index=False, encoding="utf-8-sig")
 
     print(f"\n✅ Done! {len(df)} rows → {out}")
