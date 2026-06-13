@@ -3,10 +3,9 @@
 이 파일이 하는 일:
 - `INPUT_CSV`에서 크롤러가 만든 원본 CSV를 읽는다.
 - 각 row의 `description + body`를 원문 설명으로 만들고 HTML/Markdown 노이즈를 정리한다.
-- 원문에서 영어 설명과 한국어 설명을 만든다.
-- 영어/한국어 설명을 검색용 토큰으로 바꾸고 불용어를 제거한다.
-- tags/categories를 메타 토큰으로 만들어 토큰열 시작, 매 20토큰, 끝, 영한 경계에 삽입한다.
-- 출력 CSV에는 원본 컬럼 순서를 유지하고 `description` 컬럼 값만 전처리 결과로 교체한다.
+- 원문이 영어가 아니면 영어로 번역하고, 영어 검색용 토큰으로 전처리한다.
+- tags/categories를 메타 토큰으로 만들어 토큰열 시작, 매 20토큰, 끝에 삽입한다.
+- 출력 CSV에는 원본 컬럼 순서를 유지하고 `description`을 교체한 뒤 `complete` 컬럼을 추가한다.
 
 이 파일에 넣으면 안 되는 일:
 - Hugging Face 모델 로드/양자화/번역 generation 구현은 `translategemma_translator.py`에 둔다.
@@ -27,6 +26,9 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import pandas as pd
+from langdetect import DetectorFactory, LangDetectException, detect_langs
+from lemminflect import getLemma
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS as SKLEARN_STOP_WORDS
 
 from translategemma_translator import (
     TranslateGemmaConfig,
@@ -54,6 +56,7 @@ OUTPUT_CSV = "./datasets/modrinth_dataset_preprocessed.csv"
 # TranslateGemma 결과 캐시 파일이다. 같은 설명을 매번 다시 번역하지 않기 위해 쓴다.
 TRANSLATION_CACHE = "./datasets/translation_cache.json"
 
+
 # Hugging Face에서 받을 TranslateGemma 모델 ID를 넣는다.
 TRANSLATE_MODEL_ID = "google/translategemma-4b-it"
 # None이면 ./models/<safe_model_id>를 쓴다. 이미 받은 모델 폴더를 직접 지정할 때만 넣는다.
@@ -62,8 +65,8 @@ TRANSLATE_MODEL_DIR = None
 USE_TRANSLATION = True
 
 # 지원값: none, 8bit, 4bit. 양자화는 모델 다운로드가 아니라 로드 시점 설정이다.
-TRANSLATE_QUANTIZATION = "4bit"
-MODEL_DTYPE = "bfloat16"
+TRANSLATE_QUANTIZATION = "8bit"
+MODEL_DTYPE = "float16"
 TRANSLATE_DEVICE_MAP = None
 
 # bitsandbytes 4bit/8bit 세부 설정. 잘 모르면 기본값을 유지한다.
@@ -75,11 +78,11 @@ BNB_8BIT_THRESHOLD = 6.0
 # 번역 chunk 예산.
 # 입력 토큰은 원문+chat template이 모델에 들어가는 길이이고,
 # 출력 토큰은 번역문으로 새로 생성되는 길이다. 출력이 부족하면 로그가 뜬다.
-MAX_TRANSLATE_INPUT_TOKENS = 512
+MAX_TRANSLATE_INPUT_TOKENS = 1024
 # 일반 chunk 예산을 넘는 단일 문장도 이 절대 한도 이하이면 번역을 시도한다.
 HARD_MAX_TRANSLATE_INPUT_TOKENS = 1800
-MAX_TRANSLATE_OUTPUT_TOKENS = 512
-MIN_TRANSLATE_OUTPUT_TOKENS = 64
+MAX_TRANSLATE_OUTPUT_TOKENS = 2000
+MIN_TRANSLATE_OUTPUT_TOKENS = 1
 OUTPUT_TOKEN_RATIO = 1.5
 
 # 번역이 비정상적으로 길어지거나 실패할 때 실제 입력/출력을 출력하고 파일로 남긴다.
@@ -127,25 +130,55 @@ REQUIRED_COLUMNS = [
 # 불용어
 # =========================
 
-# 한국어 번역 결과에서 검색 의미가 약한 일반 표현을 제거한다.
-# 장르/의도 단어(퀘스트, 탐험, 자동화, 최적화 등)는 여기에 넣지 않는다.
-KO_STOPWORDS = {
-    "것", "수", "등", "때", "곳", "거", "점", "중", "전", "후",
-    "내", "외", "위", "뒤", "더", "또", "및", "좀", "매우",
-    "그리고", "그러나", "하지만", "또한", "또는", "혹은",
-    "하다", "되다", "있다", "없다", "같다", "아니다",
-    "위해", "위한", "대해", "대한", "통한", "통해", "관련",
-    "가능", "필요", "경우", "부분", "내용", "페이지",
-    "마인크래프트", "마크", "모드팩", "팩", "모드",
-    "공식", "버전", "포함", "추가", "제공", "사용", "플레이",
-    "경험", "패키지", "구성", "기반", "중심",
-    "당신", "여러", "모든", "많은", "새로운", "간단하다",
-    "패브릭", "포지", "네오포지", "퀼트",
+DetectorFactory.seed = 0
+LANG_ALIASES = {
+    "en": "en",
+    "ko": "ko",
+    "ja": "ja",
+    "zh-cn": "zh",
+    "zh-tw": "zh",
+    "zh": "zh",
+}
+LEMMA_UPOS_ORDER = ("NOUN", "VERB", "ADJ", "ADV")
+TOKEN_ALIASES = {
+    "optimise": "optimize",
+    "optimisation": "optimization",
+}
+SCRIPT_LANGUAGE_RE = (
+    ("ko", re.compile(r"[가-힣]")),
+    ("ja", re.compile(r"[\u3040-\u30ff]")),
+    ("zh", re.compile(r"[\u4e00-\u9fff]")),
+)
+MIN_SCRIPT_CHARS = 6
+MIN_SCRIPT_TO_LATIN_RATIO = 0.12
+
+# 마인크래프트 생태계 고유명사와 검색 의도 단어는 불용어보다 우선 보존한다.
+PROTECTED_TERMS = {
+    "adventure", "ae2", "animation", "apocalypse", "api", "applied", "ars",
+    "automation", "backpack", "biome", "block", "boss", "botania", "bukkit",
+    "c2me", "cave", "challenging", "chat", "client", "clientside",
+    "cobblemon", "combat", "create", "cursed", "datapack", "decoration",
+    "dimension", "dungeon", "economy", "embeddium", "end", "energistics",
+    "engineering", "entity", "equipment", "exploration", "fabric", "factory",
+    "fantasy", "ferritecore", "food", "forge", "fps", "ftb", "gui",
+    "hardcore", "horror", "hud", "immersive", "indium", "industrial",
+    "inventory", "iris", "item", "kitchen", "krypton", "kubejs", "library",
+    "lightweight", "lithium", "magic", "management", "map", "medieval",
+    "mekanism", "minigame", "minimap", "mmorpg", "mob", "modernfix",
+    "modloader", "multiplayer", "neoforge", "nether", "noisium", "nvidium",
+    "oculus", "ore", "origin", "origins", "overworld", "paper",
+    "performance", "phosphor", "pokemon", "progression", "purpur", "pve",
+    "pvp", "qol", "quest", "quilt", "refined", "resource", "resourcepack",
+    "rpg", "server", "serverside", "shader", "singleplayer", "sink",
+    "skyblock", "smp", "social", "sodium", "spigot", "starlight", "storage",
+    "structure", "survival", "tech", "technology", "terrain", "texture",
+    "thermal", "transportation", "utility", "vanilla", "vanilla+", "visual",
+    "voice", "vulkan", "vulkanmod", "waystone", "world", "worldgen", "yung",
+    "zombie",
 }
 
-# 영어 설명에서 너무 자주 반복되어 검색 구분력이 낮은 단어를 제거한다.
-# `create`, `vanilla`, `quest`, `performance`, `optimization`, `server`,
-# `world`, `adventure`처럼 모드팩 검색 의도가 되는 단어는 보존한다.
+# 영어 설명에서 너무 자주 반복되어 추천 구분력이 낮은 기능어와 소개 문구를 제거한다.
+# PROTECTED_TERMS에 있는 단어는 여기에 들어 있어도 최종적으로 보존된다.
 EN_STOPWORDS = {
     "i", "me", "my", "myself", "we", "our", "ours", "ourselves",
     "you", "your", "yours", "yourself", "yourselves",
@@ -165,7 +198,7 @@ EN_STOPWORDS = {
     "just", "now", "also", "some", "any", "both", "each", "few", "most",
     "other", "another", "more", "less", "many", "one", "two", "three", "even",
     "use", "used", "using", "make", "makes", "made", "get", "gets", "got",
-    "want", "wants", "like",
+    "want", "wants", "like", "enjoy", "find", "join",
     "minecraft", "modpack", "modpacks", "mod", "mods",
     "pack", "packs", "package", "packages",
     "include", "includes", "included", "including",
@@ -175,9 +208,23 @@ EN_STOPWORDS = {
     "need", "needs", "built", "designed", "based", "focused",
     "simple", "proper", "true", "best", "popular", "better",
     "play", "playing", "game", "mc", "modrinth", "discord",
+    "player", "players", "thing", "things", "stuff",
     "config", "configuration", "menu", "add", "adds", "added", "adding",
-    "fabric", "forge", "neoforge", "quilt",
+    "summary", "details", "description", "information", "note", "important",
+    "please", "click", "link", "links", "list", "title", "section",
+    "recommend", "recommends", "recommended", "recommendation",
+    "install", "installs", "installed", "installing", "installation",
+    "available", "default", "optional", "required", "compatible",
+    "launcher", "profile", "settings", "issue", "issues", "report",
+    "read", "work", "works", "working", "run", "runs", "running",
+    "able", "allow", "allows", "try", "today", "thanks", "welcome",
+    "smooth", "smoother", "improved", "improvement", "improvements",
+    "quality", "life", "ram", "gb", "mb", "memory", "allocate", "allocated",
+    "download", "downloads", "http", "https", "www", "com", "src", "href",
+    "png", "jpg", "jpeg", "gif", "image", "images", "logo", "readme",
+    "curseforge", "github", "wiki",
 }
+EN_STOPWORDS = (EN_STOPWORDS | set(SKLEARN_STOP_WORDS)) - PROTECTED_TERMS
 
 
 # =========================
@@ -194,7 +241,10 @@ class HtmlToText(HTMLParser):
         "pre", "section", "summary", "table", "tbody", "td", "tfoot", "th",
         "thead", "tr", "ul",
     }
-    SKIP_TAGS = {"script", "style", "iframe", "svg", "video", "audio", "picture"}
+    SKIP_TAGS = {
+        "script", "style", "iframe", "svg", "video", "audio", "picture",
+        "pre", "code", "kbd", "samp",
+    }
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -245,14 +295,17 @@ def clean_text(text: str) -> str:
     text = html.unescape("" if pd.isna(text) else str(text))
 
     # 코드/이미지/링크를 먼저 정리한다. URL은 검색 의미보다 노이즈가 큰 경우가 많다.
+    text = re.sub(r"<!--.*?-->", "\n", text, flags=re.DOTALL)
     text = re.sub(r"```.*?```|~~~.*?~~~", "\n", text, flags=re.DOTALL)
+    text = re.sub(r"(?m)^\s{4,}\S.*$", "\n", text)
+    text = re.sub(r"<(?:script|style|iframe|svg|video|audio|picture|pre|code|kbd|samp)\b[^>]*>.*?</(?:script|style|iframe|svg|video|audio|picture|pre|code|kbd|samp)>", "\n", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"\[!\[[^\]]*](?:\([^)]+\)|\[[^\]]+])]\([^)]+\)", "\n", text)
     text = re.sub(r"!\[[^\]]*]\([^)]+\)", "\n", text)
     text = re.sub(r"!\[[^\]]*]\[[^\]]+]", "\n", text)
     text = re.sub(r"\[([^\]]+)]\([^)]+\)", r"\1", text)
     text = re.sub(r"\[([^\]]+)]\[[^\]]+]", r"\1", text)
     text = re.sub(r"(?m)^\s*\[[^\]]+]:\s*\S+.*$", "\n", text)
-    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
+    text = re.sub(r"<?(?:https?://[^\s<>)]+|www\.[^\s<>)]+|mailto:[^\s<>)]+)>?", " ", text)
 
     # Markdown 장식 문법은 제거하되 제목/목록의 텍스트 자체는 보존한다.
     text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "\n", text)
@@ -278,79 +331,92 @@ def clean_text(text: str) -> str:
 # 언어 감지와 토큰화
 # =========================
 
-TOKEN_RE = re.compile(r"[A-Za-z0-9가-힣][A-Za-z0-9가-힣+#._-]*")
+TOKEN_RE = re.compile(r"[A-Za-z0-9+#][A-Za-z0-9+#._-]*")
+VERSION_RE = re.compile(r"^\d+(?:\.\d+){1,3}$")
+PHRASE_REPLACEMENTS = (
+    (re.compile(r"\bquality\s+of\s+life\b", re.IGNORECASE), "qol"),
+    (re.compile(r"\bclient\s+side\b", re.IGNORECASE), "clientside"),
+    (re.compile(r"\bserver\s+side\b", re.IGNORECASE), "serverside"),
+    (re.compile(r"\bresource\s+pack\b", re.IGNORECASE), "resourcepack"),
+    (re.compile(r"\bdata\s+pack\b", re.IGNORECASE), "datapack"),
+    (re.compile(r"\bmod\s+loader\b", re.IGNORECASE), "modloader"),
+    (re.compile(r"\bworld\s+gen(?:eration)?\b", re.IGNORECASE), "worldgen"),
+    (re.compile(r"\bkitchen\s+sink\b", re.IGNORECASE), "kitchen sink"),
+    (re.compile(r"\bvanilla\s+plus\b", re.IGNORECASE), "vanilla+"),
+)
 
 
 def detect_language(text: str) -> str:
-    """source_text의 주 언어를 간단히 추정한다.
-
-    Modrinth 데이터는 대부분 영어이므로, 한글/일본어/중국어 신호가 약하면 영어로 본다.
-    """
-    text = str(text)
-    hangul = len(re.findall(r"[가-힣]", text))
-    latin = len(re.findall(r"[A-Za-z]", text))
-    kana = len(re.findall(r"[\u3040-\u30ff]", text))
-    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
-
-    if hangul >= 10 and hangul > latin * 0.3:
-        return "ko"
-    if kana >= 10 and kana > latin * 0.3:
-        return "ja"
-    if cjk >= 10 and cjk > latin * 0.3:
-        return "zh"
-    if latin > 0:
-        return "en"
-    return "unknown"
+    """langdetect로 source_text의 주 언어를 추정한다."""
+    sample = normalize_spacing(text)[:4000]
+    if not sample:
+        return "unknown"
+    latin_count = len(re.findall(r"[A-Za-z]", sample))
+    for lang, pattern in SCRIPT_LANGUAGE_RE:
+        script_count = len(pattern.findall(sample))
+        if script_count >= MIN_SCRIPT_CHARS and script_count >= latin_count * MIN_SCRIPT_TO_LATIN_RATIO:
+            return lang
+    try:
+        candidates = detect_langs(sample)
+    except LangDetectException:
+        return "unknown"
+    if not candidates:
+        return "unknown"
+    best = candidates[0]
+    if best.prob < 0.60:
+        return "unknown"
+    return LANG_ALIASES.get(best.lang.lower(), best.lang.split("-", 1)[0].lower())
 
 
 def strip_token_noise(text: str) -> str:
-    """번역 이후 남아 있을 수 있는 URL/문장부호 노이즈를 토큰화 전에 한 번 더 정리한다."""
-    text = re.sub(r"https?://\S+|www\.\S+", " ", str(text))
-    text = re.sub(r"[`*_~<>{}\[\]()/\\|=]", " ", text)
+    """번역 이후 남아 있을 수 있는 URL/문장부호/마크다운 노이즈를 토큰화 전에 한 번 더 정리한다."""
+    text = html.unescape(str(text))
+    for pattern, replacement in PHRASE_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"<?(?:https?://[^\s<>)]+|www\.[^\s<>)]+|mailto:[^\s<>)]+)>?", " ", text)
+    text = re.sub(r"[`*_~<>{}\[\]()/\\|=:$;,!?\"']", " ", text)
     return text.lower()
 
 
+def split_english_terms(raw: str) -> list[str]:
+    """하이픈/언더스코어 복합어는 검색 가능한 작은 단어로 나눈다."""
+    token = raw.strip("._-").lower()
+    if not token:
+        return []
+    if VERSION_RE.fullmatch(token):
+        return [token]
+    return [part for part in re.split(r"[._-]+", token) if part]
+
+
+def lemmatize_english_token(token: str) -> str:
+    """LemmInflect로 영어 토큰을 자동 원형화한다."""
+    if token in PROTECTED_TERMS or VERSION_RE.fullmatch(token) or any(ch.isdigit() for ch in token):
+        return token
+    for upos in LEMMA_UPOS_ORDER:
+        lemmas = getLemma(token, upos=upos)
+        if lemmas:
+            lemma = lemmas[0].lower()
+            return TOKEN_ALIASES.get(lemma, lemma)
+    return TOKEN_ALIASES.get(token, token)
+
+
 def preprocess_english(text: str) -> list[str]:
-    """영어 설명을 공백 분리 검색 토큰으로 만든다.
-
-    여기에 들어가는 값:
-    - TranslateGemma 번역 전/후의 영어 설명 문자열
-
-    반환값:
-    - TF-IDF/Word2Vec 학습에 그대로 split해서 쓸 토큰 리스트
-    """
+    """영어 설명을 TF-IDF/Word2Vec 학습용 공백 분리 토큰으로 만든다."""
     tokens: list[str] = []
     for raw in TOKEN_RE.findall(strip_token_noise(text)):
-        token = raw.strip("._-")
-        if not token:
-            continue
-        if token in EN_STOPWORDS:
-            continue
-        if len(token) <= 1 and not token.isdigit():
-            continue
-        tokens.append(token)
-    return tokens
-
-
-def preprocess_korean(text: str) -> list[str]:
-    """한국어 설명을 공백 분리 검색 토큰으로 만든다.
-
-    현재는 추가 Java/konlpy 의존성을 피하기 위해 정규식 토큰화와 불용어 제거만 한다.
-    이후 `generate_model.py`에서 형태소 분석을 붙일 수 있지만, CSV 전처리기는
-    여기서 이미 영어+한국어 검색 신호를 한 컬럼에 만들어 둔다.
-    """
-    tokens: list[str] = []
-    for raw in TOKEN_RE.findall(strip_token_noise(text)):
-        token = raw.strip("._-")
-        if not token:
-            continue
-        if re.search(r"[가-힣]", token) and token in KO_STOPWORDS:
-            continue
-        if re.fullmatch(r"[a-z0-9+#._-]+", token) and token in EN_STOPWORDS:
-            continue
-        if len(token) <= 1 and not token.isdigit():
-            continue
-        tokens.append(token)
+        for part in split_english_terms(raw):
+            token = lemmatize_english_token(part)
+            if token in PROTECTED_TERMS:
+                tokens.append(token)
+                continue
+            if token in EN_STOPWORDS:
+                continue
+            if len(token) <= 1 and not token.isdigit():
+                continue
+            if token.isdigit() and len(token) > 4:
+                continue
+            tokens.append(token)
     return tokens
 
 
@@ -398,25 +464,99 @@ def insert_meta(tokens: list[str], meta: list[str]) -> list[str]:
     return output
 
 
-# =========================
-# 전체 처리 흐름
-# =========================
+def build_source_text(row) -> str:
+    """description과 body를 정리해 번역/전처리에 넣을 원문을 만든다."""
+    source_parts = [
+        clean_text(row.get("description", "")),
+        clean_text(row.get("body", "")),
+    ]
+    return normalize_spacing("\n\n".join(part for part in source_parts if part))
 
 
-def main():
-    # 1. 원본 CSV가 있는지 확인하고 읽는다.
-    if not Path(INPUT_CSV).exists():
-        raise FileNotFoundError(f"Input CSV not found: {INPUT_CSV}")
+def csv_text(value) -> str:
+    """CSV의 빈 값을 문자열 'nan'으로 바꾸지 않고 읽는다."""
+    return "" if pd.isna(value) else str(value)
 
-    df = pd.read_csv(INPUT_CSV)
 
-    # 2. 크롤러가 만들어야 하는 필수 컬럼이 빠졌는지 확인한다.
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
+def row_key(row) -> str:
+    """재시도 판단에 쓸 안정적인 row 키를 만든다."""
+    return csv_text(row.get("slug", "")) or csv_text(row.get("url", ""))
 
-    # 3. 번역기 설정을 만든다. 실제 모델 로드/양자화/다운로드 코드는 별도 파일에 있다.
-    translator = TranslateGemmaTranslator(TranslateGemmaConfig(
+
+def is_complete_value(value) -> bool:
+    """complete 컬럼에서 1/true 계열만 완료로 인정한다."""
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def output_columns(df: pd.DataFrame) -> list[str]:
+    """원본 컬럼 뒤에 complete 컬럼만 추가한다."""
+    return list(df.columns) + (["complete"] if "complete" not in df.columns else [])
+
+
+def normalize_existing_output(output_csv: str, columns: list[str]) -> dict[str, bool]:
+    """기존 출력 CSV를 읽어 slug별 최신 complete 상태를 만든다."""
+    path = Path(output_csv)
+    if not path.exists() or path.stat().st_size == 0:
+        return {}
+
+    out_df = pd.read_csv(path)
+    if "complete" not in out_df.columns:
+        out_df["complete"] = 0
+        out_df.to_csv(path, index=False, encoding="utf-8-sig")
+
+    status: dict[str, bool] = {}
+    for _idx, row in out_df.iterrows():
+        key = row_key(row)
+        if key:
+            status[key] = is_complete_value(row.get("complete", 0))
+    return status
+
+
+def append_output_row(row, processed_description: str, complete: int, columns: list[str]) -> None:
+    """row 처리 결과를 최종 출력 CSV에 즉시 append한다."""
+    path = Path(OUTPUT_CSV)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    record = row.to_dict()
+    record["description"] = processed_description
+    record["complete"] = int(complete)
+
+    write_header = not path.exists() or path.stat().st_size == 0
+    pd.DataFrame([record], columns=columns).to_csv(
+        path,
+        mode="a",
+        header=write_header,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+def build_processed_description(row, english_text: str) -> str:
+    """영어 텍스트와 메타 토큰으로 최종 description 문자열을 만든다."""
+    meta = meta_tokens(row)
+    en_tokens = insert_meta(preprocess_english(english_text), meta)
+    return " ".join(en_tokens).strip()
+
+
+def translate_source_text(translator, source_text: str, lang: str, cache: dict[str, str], row_label: str) -> str:
+    """영어가 아닌 source_text만 영어로 번역한다."""
+    if not USE_TRANSLATION:
+        return source_text
+    if lang in {"en", "unknown"}:
+        return source_text
+    return translator.translate_text(
+        source_text,
+        lang,
+        "en",
+        cache,
+        label=row_label,
+        raise_on_failure=True,
+    ) or source_text
+
+
+def make_translator() -> TranslateGemmaTranslator:
+    """전처리와 검색이 같은 TranslateGemma 설정을 쓰게 번역기를 만든다."""
+    return TranslateGemmaTranslator(TranslateGemmaConfig(
         model_id=TRANSLATE_MODEL_ID,
         model_dir=TRANSLATE_MODEL_DIR,
         cache_path=TRANSLATION_CACHE,
@@ -440,74 +580,83 @@ def main():
         log_progress=TRANSLATE_LOG_PROGRESS,
         log_preview_chars=TRANSLATE_LOG_PREVIEW_CHARS,
     ))
-    if USE_TRANSLATION:
-        translator.load()
 
+
+# =========================
+# 전체 처리 흐름
+# =========================
+
+
+def main():
+    # 1. 원본 CSV가 있는지 확인하고 읽는다.
+    if not Path(INPUT_CSV).exists():
+        raise FileNotFoundError(f"Input CSV not found: {INPUT_CSV}")
+
+    df = pd.read_csv(INPUT_CSV)
+    columns = output_columns(df)
+    complete_by_key = normalize_existing_output(OUTPUT_CSV, columns)
+
+    # 2. 크롤러가 만들어야 하는 필수 컬럼이 빠졌는지 확인한다.
+    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    # 3. 번역기 설정을 만든다. 실제 모델 로드/양자화/다운로드 코드는 별도 파일에 있다.
+    translator = make_translator()
     # 4. 이미 번역한 원문은 캐시에서 재사용한다.
     cache = load_translation_cache(TRANSLATION_CACHE)
-    descriptions: list[str] = []
+    success_count = 0
+    error_count = 0
+    skipped_count = 0
 
     for idx, row in tqdm(df.iterrows(), total=len(df), desc="Preprocessing"):
         start = time.perf_counter()
+        key = row_key(row)
+        if key and complete_by_key.get(key):
+            skipped_count += 1
+            continue
 
         # 5. 짧은 description과 긴 body를 각각 정리한 뒤 하나의 원문으로 합친다.
         #    \n\n은 번역기가 둘을 다른 문단으로 볼 수 있게 하는 경계다.
-        source_parts = [
-            clean_text(row.get("description", "")),
-            clean_text(row.get("body", "")),
-        ]
-        source_text = normalize_spacing("\n\n".join(part for part in source_parts if part))
-
+        source_text = build_source_text(row)
+        row_label = f"row={idx} name={str(row.get('name', '')).strip()[:80]}"
         if not source_text:
-            descriptions.append("")
-        else:
-            # 6. 원문 언어를 판정한다. 영어/한국어가 아닌 경우에도 2단 번역은 하지 않는다.
+            append_output_row(row, "", 1, columns)
+            if key:
+                complete_by_key[key] = True
+            success_count += 1
+            continue
+
+        try:
+            # 6. 원문 언어를 판정하고, 영어가 아니면 원문에서 영어로 직접 번역한다.
             lang = detect_language(source_text)
-            row_label = f"row={idx} name={str(row.get('name', '')).strip()[:80]}"
+            english_text = translate_source_text(translator, source_text, lang, cache, row_label)
+            processed_description = build_processed_description(row, english_text)
+        except Exception as exc:
+            error_count += 1
+            append_output_row(row, "", 0, columns)
+            if key:
+                complete_by_key[key] = False
+            save_translation_cache(cache, TRANSLATION_CACHE)
+            print(f"[row failed] index={idx} error={exc}")
+            continue
 
-            # 7. 영어 설명과 한국어 설명을 만든다.
-            #    원문이 이미 목표 언어면 그대로 쓰고, 필요한 쪽만 원문에서 직접 번역한다.
-            if not USE_TRANSLATION:
-                en_text = source_text
-                ko_text = ""
-            elif lang == "ko":
-                ko_text = source_text
-                en_text = translator.translate_text(source_text, "ko", "en", cache, label=row_label) or source_text
-            elif lang == "en":
-                en_text = source_text
-                ko_text = translator.translate_text(source_text, "en", "ko", cache, label=row_label)
-            elif lang in {"ja", "zh"}:
-                en_text = translator.translate_text(source_text, lang, "en", cache, label=row_label) or source_text
-                ko_text = translator.translate_text(source_text, lang, "ko", cache, label=row_label)
-            else:
-                print("[language unknown] source language unknown; keeping source as english_text and skipping korean translation")
-                en_text = source_text
-                ko_text = ""
-
-            # 8. tags/categories를 검색용 메타 토큰으로 만든다.
-            meta = meta_tokens(row)
-
-            # 9. 영어/한국어 텍스트를 각각 검색용 토큰으로 바꾸고, 각 언어 토큰열에 메타 토큰을 삽입한다.
-            en_tokens = insert_meta(preprocess_english(en_text), meta)
-            ko_tokens = insert_meta(preprocess_korean(ko_text), meta)
-
-            # 10. 최종 출력은 별도 영어/한국어 컬럼이 아니라 기존 description 한 칸이다.
-            #     영한 경계에도 meta를 한 번 더 넣어 어느 쪽 텍스트로 검색해도 태그 신호가 남게 한다.
-            descriptions.append(" ".join(en_tokens + (meta if meta else []) + ko_tokens).strip())
+        append_output_row(row, processed_description, 1, columns)
+        if key:
+            complete_by_key[key] = True
+        success_count += 1
 
         if PRINT_ROW_TIMING:
             print(f"[row] index={idx} elapsed={time.perf_counter() - start:.1f}s")
-        if idx and idx % CACHE_SAVE_EVERY == 0:
+        if success_count and success_count % CACHE_SAVE_EVERY == 0:
             save_translation_cache(cache, TRANSLATION_CACHE)
 
-    # 11. 마지막 캐시를 저장하고, 원본 컬럼 순서를 유지한 채 description 값만 교체한다.
+    # 7. 마지막 캐시를 저장하고 이번 실행의 처리 결과를 출력한다.
     save_translation_cache(cache, TRANSLATION_CACHE)
-
-    out_df = df.copy()
-    out_df["description"] = descriptions
-    Path(OUTPUT_CSV).parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-    print(f"done: {OUTPUT_CSV}")
+    print(
+        f"done: {OUTPUT_CSV} "
+        f"success={success_count} errors={error_count} skipped={skipped_count}"
+    )
 
 
 if __name__ == "__main__":

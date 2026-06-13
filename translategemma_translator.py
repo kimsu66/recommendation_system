@@ -730,6 +730,7 @@ class TranslateGemmaTranslator:
         target_lang: str,
         cache: dict[str, str],
         label: str = "",
+        raise_on_failure: bool = False,
     ) -> str:
         """긴 텍스트를 chunk 단위로 직접 번역하고 캐시한다."""
         started_at = time.perf_counter()
@@ -815,6 +816,11 @@ class TranslateGemmaTranslator:
                 f"elapsed={total_elapsed:.1f}s chunks={len(chunks)} failed={failed_chunks} "
                 f"output_chars={len(result_text)} cache_saved=False"
             )
+            if raise_on_failure:
+                raise RuntimeError(
+                    f"translation incomplete: chunks={len(chunks)} failed={failed_chunks} "
+                    f"source={source_lang} target={target_lang}"
+                )
             return result_text
 
         cache[key] = result_text
