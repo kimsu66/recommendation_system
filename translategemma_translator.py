@@ -384,6 +384,35 @@ class TranslateGemmaTranslator:
         pieces = re.split(r"(?<=[.!?。！？])\s+", str(text).strip())
         return [piece.strip() for piece in pieces if piece.strip()] or [str(text).strip()]
 
+    def split_soft_boundaries(self, text: str) -> list[str]:
+        """문장 부호가 부족한 모드 목록/파일 목록을 약한 경계로 나눈다."""
+        pieces = re.split(
+            r"(?<=[,;:，；：、])\s+|\s+-\s+|(?<=\])\s+|\s+(?=\[)",
+            str(text).strip(),
+        )
+        return [piece.strip() for piece in pieces if piece.strip()]
+
+    def split_in_half(self, text: str) -> list[str]:
+        """뚜렷한 구분자가 없는 긴 덩어리를 마지막 수단으로 반으로 나눈다."""
+        words = str(text).split()
+        if len(words) > 1:
+            midpoint = len(words) // 2
+            return [" ".join(words[:midpoint]), " ".join(words[midpoint:])]
+
+        text = str(text).strip()
+        if len(text) <= 1:
+            return [text] if text else []
+        midpoint = len(text) // 2
+        return [text[:midpoint].strip(), text[midpoint:].strip()]
+
+    def split_oversized_segment(self, segment: str) -> list[str]:
+        """입력 예산을 넘는 단일 segment를 문장, 약한 경계, 반분 순서로 쪼갠다."""
+        for splitter in (self.split_sentences, self.split_soft_boundaries, self.split_in_half):
+            pieces = splitter(segment)
+            if len(pieces) > 1:
+                return pieces
+        return [segment]
+
     def chunk_input_token_limit(self) -> int:
         """번역 출력까지 고려해 모델 카드의 2K 예산 안에 들어갈 입력 chunk 크기를 잡는다."""
         ratio_limit = int((self.config.max_total_tokens - self.config.min_output_tokens) / (1 + self.config.output_token_ratio))
@@ -400,14 +429,11 @@ class TranslateGemmaTranslator:
                 if current:
                     chunks.append(current)
                     current = ""
-                if separator == " ":
-                    if self.count_input_tokens(segment, source_lang, target_lang) <= self.config.hard_max_input_tokens:
-                        print(f"[translation oversized sentence] input_tokens>{token_limit}; trying as one chunk")
-                        chunks.append(segment)
-                        continue
-                    print(f"[translation skip: over hard token budget] {segment[:120]}")
+                pieces = self.split_oversized_segment(segment)
+                if len(pieces) == 1:
+                    print(f"[translation skip: cannot split over token budget] {segment[:120]}")
                     continue
-                chunks.extend(self.pack_segments(self.split_sentences(segment), " ", source_lang, target_lang))
+                chunks.extend(self.pack_segments(pieces, " ", source_lang, target_lang))
                 continue
 
             candidate = segment if not current else f"{current}{separator}{segment}"
@@ -656,13 +682,7 @@ class TranslateGemmaTranslator:
         if len(sentences) > 1:
             return sentences
 
-        # 마지막 fallback이다. 단일 문장이 너무 길어 번역 출력이 계속 잘리면
-        # 쉼표/세미콜론 같은 약한 구분점으로 쪼개 본다.
-        clauses = [part.strip() for part in re.split(r"(?<=[,;:])\s+", chunk) if part.strip()]
-        if len(clauses) > 1:
-            return clauses
-
-        return [chunk]
+        return self.split_oversized_segment(chunk)
 
     def translate_chunk(self, chunk: str, source_lang: str, target_lang: str, depth: int = 0) -> str:
         """chunk 하나를 번역한다.
@@ -671,6 +691,18 @@ class TranslateGemmaTranslator:
         그래도 잘리면 chunk를 더 작게 나눠 재귀적으로 다시 번역한다.
         """
         input_tokens = self.count_input_tokens(chunk, source_lang, target_lang)
+        token_limit = self.chunk_input_token_limit()
+        if input_tokens > token_limit:
+            smaller_chunks = self.pack_segments(self.split_oversized_segment(chunk), " ", source_lang, target_lang)
+            if len(smaller_chunks) > 1 and depth < 8:
+                print(f"[translation retry: split oversized input] input_tokens={input_tokens} chunks={len(smaller_chunks)}")
+                translated = [
+                    self.translate_chunk(part, source_lang, target_lang, depth=depth + 1)
+                    for part in smaller_chunks
+                    if part.strip()
+                ]
+                return normalize_spacing("\n\n".join(part for part in translated if part))
+
         if input_tokens > self.config.hard_max_input_tokens:
             raise RuntimeError(
                 f"translation input hard limit exceeded: input_tokens={input_tokens}, "
