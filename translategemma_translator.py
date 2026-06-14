@@ -76,6 +76,7 @@ class TranslateGemmaConfig:
 
     max_input_tokens: int = 512
     hard_max_input_tokens: int = 1800
+    max_total_tokens: int = 2048
     max_output_tokens: int = 512
     min_output_tokens: int = 64
     output_token_ratio: float = 1.3
@@ -83,6 +84,8 @@ class TranslateGemmaConfig:
     debug_to_console: bool = True
     debug_dir: str = "./logs/translation_debug"
     debug_max_chars: int = 4000
+    audit_log: bool = True
+    audit_dir: str = "./logs/translation_audit"
     log_progress: bool = True
     log_preview_chars: int = 120
 
@@ -330,7 +333,6 @@ class TranslateGemmaTranslator:
         from transformers import AutoModelForImageTextToText
 
         self._model = AutoModelForImageTextToText.from_pretrained(model_dir, **model_kwargs)
-        self.configure_generation_tokens()
 
         print("[translator]")
         print(f"- model: {self.config.model_id}")
@@ -344,23 +346,6 @@ class TranslateGemmaTranslator:
             print(f"- cuda_allocated: {torch.cuda.memory_allocated() / (1024 ** 3):.2f} GiB")
 
         return self._model, self._processor
-
-    def configure_generation_tokens(self) -> None:
-        """모델 generation config에 pad/eos 토큰을 명시한다.
-
-        Transformers가 pad 토큰을 못 찾으면 매 generate 호출마다
-        `Setting pad_token_id to eos_token_id` 경고를 띄우고 eos=1을 pad로 대체한다.
-        TranslateGemma tokenizer에는 실제 pad 토큰 0과 종료 토큰 [1, 106]이 있으므로
-        로드 직후 한 번 명시해 둔다.
-        """
-        tokenizer = self._processor.tokenizer
-        pad_token_id = getattr(tokenizer, "pad_token_id", None)
-        eos_token_ids = self.generation_eos_token_ids(tokenizer, self._model)
-
-        if pad_token_id is not None:
-            self._model.generation_config.pad_token_id = int(pad_token_id)
-        if eos_token_ids is not None:
-            self._model.generation_config.eos_token_id = eos_token_ids
 
     def translation_messages(self, text: str, source_lang: str, target_lang: str) -> list[dict[str, Any]]:
         """TranslateGemma chat template 입력을 만든다."""
@@ -399,19 +384,25 @@ class TranslateGemmaTranslator:
         pieces = re.split(r"(?<=[.!?。！？])\s+", str(text).strip())
         return [piece.strip() for piece in pieces if piece.strip()] or [str(text).strip()]
 
+    def chunk_input_token_limit(self) -> int:
+        """번역 출력까지 고려해 모델 카드의 2K 예산 안에 들어갈 입력 chunk 크기를 잡는다."""
+        ratio_limit = int((self.config.max_total_tokens - self.config.min_output_tokens) / (1 + self.config.output_token_ratio))
+        return max(1, min(self.config.max_input_tokens, ratio_limit))
+
     def pack_segments(self, segments: list[str], separator: str, source_lang: str, target_lang: str) -> list[str]:
         """문단/문장을 입력 토큰 예산 이하의 chunk 목록으로 묶는다."""
         chunks: list[str] = []
         current = ""
+        token_limit = self.chunk_input_token_limit()
 
         for segment in segments:
-            if self.count_input_tokens(segment, source_lang, target_lang) > self.config.max_input_tokens:
+            if self.count_input_tokens(segment, source_lang, target_lang) > token_limit:
                 if current:
                     chunks.append(current)
                     current = ""
                 if separator == " ":
                     if self.count_input_tokens(segment, source_lang, target_lang) <= self.config.hard_max_input_tokens:
-                        print(f"[translation oversized sentence] input_tokens>{self.config.max_input_tokens}; trying as one chunk")
+                        print(f"[translation oversized sentence] input_tokens>{token_limit}; trying as one chunk")
                         chunks.append(segment)
                         continue
                     print(f"[translation skip: over hard token budget] {segment[:120]}")
@@ -420,7 +411,7 @@ class TranslateGemmaTranslator:
                 continue
 
             candidate = segment if not current else f"{current}{separator}{segment}"
-            if self.count_input_tokens(candidate, source_lang, target_lang) <= self.config.max_input_tokens:
+            if self.count_input_tokens(candidate, source_lang, target_lang) <= token_limit:
                 current = candidate
             else:
                 if current:
@@ -458,55 +449,16 @@ class TranslateGemmaTranslator:
         avg = sum(lengths) / len(lengths)
         return f"min={min(lengths)} avg={avg:.1f} max={max(lengths)}"
 
+    def max_new_token_cap(self, input_tokens: int) -> int:
+        """입력+출력이 모델 카드의 2K 예산을 넘지 않도록 출력 상한을 계산한다."""
+        remaining = self.config.max_total_tokens - input_tokens
+        return max(self.config.min_output_tokens, min(self.config.max_output_tokens, remaining))
+
     def max_new_tokens_for(self, input_tokens: int) -> int:
-        """입력 길이에 맞춰 chunk 하나의 출력 토큰 상한을 잡는다."""
+        """입력 길이에 맞춰 chunk 하나의 기본 출력 토큰 상한을 잡는다."""
         budget = int(input_tokens * self.config.output_token_ratio)
         budget = max(self.config.min_output_tokens, budget)
-        return min(self.config.max_output_tokens, budget)
-
-    def generation_eos_token_ids(self, tokenizer, model=None):
-        """generate가 멈춰야 하는 종료 토큰 목록을 만든다.
-
-        Gemma chat 계열은 일반 eos 외에 `<end_of_turn>`을 생성하고 답변을 끝낼 수 있다.
-        모델의 generation_config에도 eos_token_id=[1, 106]처럼 종료 토큰이 들어 있으므로
-        문자열 변환에만 의존하지 않고 모델 설정값도 직접 사용한다.
-        """
-        token_ids: list[int] = []
-
-        def add_token_id(token_id) -> None:
-            if token_id is None:
-                return
-            try:
-                token_id = int(token_id)
-            except (TypeError, ValueError):
-                return
-            if token_id >= 0 and token_id not in token_ids:
-                token_ids.append(token_id)
-
-        generation_config = getattr(model, "generation_config", None)
-        configured_eos = getattr(generation_config, "eos_token_id", None)
-        if isinstance(configured_eos, (list, tuple)):
-            for token_id in configured_eos:
-                add_token_id(token_id)
-        else:
-            add_token_id(configured_eos)
-
-        add_token_id(getattr(tokenizer, "eos_token_id", None))
-
-        for token in ("<end_of_turn>", "<eos>"):
-            try:
-                token_id = tokenizer.convert_tokens_to_ids(token)
-            except Exception:
-                continue
-            if token_id != getattr(tokenizer, "unk_token_id", None):
-                add_token_id(token_id)
-
-        for attr in ("eot_token_id", "end_of_turn_token_id"):
-            add_token_id(getattr(tokenizer, attr, None))
-
-        if not token_ids:
-            return None
-        return token_ids[0] if len(token_ids) == 1 else token_ids
+        return min(budget, self.max_new_token_cap(input_tokens))
 
     def clipped_debug_text(self, text: str) -> str:
         """콘솔에 출력할 디버그 텍스트를 제한한다."""
@@ -578,6 +530,58 @@ class TranslateGemmaTranslator:
             print("[generated raw]")
             print(self.clipped_debug_text(generated_raw))
 
+    def write_translation_audit(
+        self,
+        source_lang: str,
+        target_lang: str,
+        label: str,
+        source_text: str,
+        translated_text: str,
+        chunks: list[str],
+        translated_chunks: list[str],
+        total_elapsed: float,
+        cache_hit: bool = False,
+    ) -> None:
+        """번역 입출력을 항상 파일로 남겨 언어 감지와 번역 품질을 수동 검수할 수 있게 한다."""
+        if not self.config.audit_log:
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        digest = hashlib.sha1(f"{source_lang}\n{target_lang}\n{label}\n{source_text}".encode("utf-8")).hexdigest()[:12]
+        audit_path = Path(self.config.audit_dir) / f"{timestamp}_{digest}.txt"
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+
+        content = [
+            "=== TRANSLATION AUDIT ===",
+            f"label: {label}",
+            f"source_lang: {source_lang}",
+            f"target_lang: {target_lang}",
+            f"cache_hit: {int(cache_hit)}",
+            f"chunks: {len(chunks)}",
+            f"elapsed_sec: {total_elapsed:.1f}",
+            f"source_chars: {len(source_text)}",
+            f"translated_chars: {len(translated_text)}",
+            "",
+            "=== SOURCE TEXT ===",
+            source_text,
+            "",
+            "=== TRANSLATED TEXT ===",
+            translated_text,
+            "",
+        ]
+        for index, (chunk, translated_chunk) in enumerate(zip(chunks, translated_chunks), 1):
+            content.extend([
+                f"=== CHUNK {index}/{len(chunks)} SOURCE ===",
+                chunk,
+                "",
+                f"=== CHUNK {index}/{len(chunks)} TRANSLATED ===",
+                translated_chunk,
+                "",
+            ])
+        audit_path.write_text("\n".join(content), encoding="utf-8")
+        if self.config.log_progress:
+            print(f"[translation audit] {audit_path}")
+
     def translate_chunk_once(self, chunk: str, source_lang: str, target_lang: str, max_new_tokens: int) -> str:
         """chunk 하나를 지정된 출력 토큰 한도로 한 번 번역한다."""
         import torch
@@ -591,22 +595,16 @@ class TranslateGemmaTranslator:
             return_tensors="pt",
         )
         input_len = int(inputs["input_ids"].shape[-1])
-        eos_token_ids = self.generation_eos_token_ids(processor.tokenizer, model)
-        pad_token_id = getattr(processor.tokenizer, "pad_token_id", None)
+        eos_token_ids = getattr(model.generation_config, "eos_token_id", None)
         prompt_text = processor.decode(inputs["input_ids"][0], skip_special_tokens=False)
 
-        inputs = inputs.to(model.device, dtype=torch_dtype(torch, self.config.model_dtype))
+        inputs = inputs.to(model.device)
 
         generate_kwargs = {
             **inputs,
             "do_sample": False,
             "max_new_tokens": max_new_tokens,
         }
-        if pad_token_id is not None:
-            generate_kwargs["pad_token_id"] = int(pad_token_id)
-            generate_kwargs["bad_words_ids"] = [[int(pad_token_id)]]
-        if eos_token_ids is not None:
-            generate_kwargs["eos_token_id"] = eos_token_ids
 
         with torch.inference_mode():
             output = model.generate(**generate_kwargs)
@@ -681,8 +679,9 @@ class TranslateGemmaTranslator:
 
         first_limit = self.max_new_tokens_for(input_tokens)
         retry_limits = [first_limit]
-        if self.config.max_output_tokens not in retry_limits:
-            retry_limits.append(self.config.max_output_tokens)
+        retry_limit = self.max_new_token_cap(input_tokens)
+        if retry_limit not in retry_limits:
+            retry_limits.append(retry_limit)
 
         last_error: Exception | None = None
         for limit in retry_limits:
@@ -690,8 +689,8 @@ class TranslateGemmaTranslator:
                 return self.translate_chunk_once(chunk, source_lang, target_lang, limit)
             except TranslationOutputLimitError as exc:
                 last_error = exc
-                if limit < self.config.max_output_tokens:
-                    print(f"[translation retry: larger output] {limit}->{self.config.max_output_tokens}")
+                if limit < retry_limit:
+                    print(f"[translation retry: larger output] {limit}->{retry_limit}")
                     continue
 
         smaller_chunks = self.split_chunk_for_output_retry(chunk)
@@ -717,9 +716,10 @@ class TranslateGemmaTranslator:
             "quantization": normalize_quantization(self.config.quantization),
             "max_input_tokens": self.config.max_input_tokens,
             "hard_max_input_tokens": self.config.hard_max_input_tokens,
+            "max_total_tokens": self.config.max_total_tokens,
             "max_output_tokens": self.config.max_output_tokens,
             "chunking": "paragraph-then-sentence-v1",
-            "generation_stop": "official-generate-config-v1",
+            "generation_stop": "official-generate-config-v2-context-budget",
         }
         return hashlib.sha256(json.dumps(raw, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -750,6 +750,17 @@ class TranslateGemmaTranslator:
         if key in cache:
             if self.config.log_progress:
                 print(f"[translation cache hit]{label_text} {source_lang}->{target_lang} chars={len(text)}")
+            self.write_translation_audit(
+                source_lang=source_lang,
+                target_lang=target_lang,
+                label=label,
+                source_text=text,
+                translated_text=cache[key],
+                chunks=[text],
+                translated_chunks=[cache[key]],
+                total_elapsed=time.perf_counter() - started_at,
+                cache_hit=True,
+            )
             return cache[key]
 
         paragraphs = self.split_paragraphs(text)
@@ -824,6 +835,17 @@ class TranslateGemmaTranslator:
             return result_text
 
         cache[key] = result_text
+        self.write_translation_audit(
+            source_lang=source_lang,
+            target_lang=target_lang,
+            label=label,
+            source_text=text,
+            translated_text=result_text,
+            chunks=chunks,
+            translated_chunks=translated,
+            total_elapsed=total_elapsed,
+            cache_hit=False,
+        )
         if self.config.log_progress:
             print(
                 f"[translation done]{label_text} {source_lang}->{target_lang} "
